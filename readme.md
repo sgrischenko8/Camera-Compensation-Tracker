@@ -11,6 +11,7 @@
 * **Motion Compensation:** Distinguishes between apparent screen motion and real-world object movement by subtracting camera motion vectors.
 * **Time-to-Collision (TTC):** Automatically calculates estimated time-to-collision for approaching objects based on real-world area growth rates.
 * **Detailed Reporting:** Generates an annotated output video (`.avi`) and a comprehensive JSON report containing motion statistics and descriptions.
+* **Motion Plots:** Automatically builds 3 charts from the JSON report — camera motion (dx/dy), real (camera-compensated) object motion in pixels, and time-to-collision per object.
 
 ---
 
@@ -29,4 +30,7 @@ Run the processing pipeline using:
 python main.py
 ```
 
-The script will output an annotated video (./output_tracked.avi) and a JSON log file (./object_motion_camera_compensated.json) with detailed interval statistics.
+The script will output an annotated video (./output_tracked.avi) and a JSON log file (./object_motion_camera_compensated.json) with detailed interval statistics, and will automatically generate 3 charts based on that JSON file into the ./plots directory:
+* `camera_motion.png` — camera dx/dy over time
+* `object_real_motion.png` — real (camera-compensated) object motion in pixels
+* `time_to_collision.png` — time-to-collision per object (capped at 1000s)

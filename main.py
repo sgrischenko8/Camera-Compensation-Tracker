@@ -2,6 +2,7 @@ import cv2
 import json
 from camera_motion import CameraMotionEstimator
 from yolo_tracker import ObjectMotionTracker
+from motion_plots import plot_motion_results
 
 VIDEO_PATH = "./test_video.mp4"
 OUTPUT_VIDEO_PATH = "./output_tracked.avi"
@@ -90,8 +91,6 @@ def main():
     cam_interval_number = 1
 
     pending_obj_result = None
-
-
 
     while True:
         ret, frame = cap.read()
@@ -231,6 +230,8 @@ def main():
 
     print(f"  Video with annotations: {OUTPUT_VIDEO_PATH}")
     print(f"  Camera + objects (screen and compensated): {RESULT_FILE}")
+
+    plot_motion_results(json_path=RESULT_FILE, output_dir="./plots")
 
 if __name__ == "__main__":
     main()
