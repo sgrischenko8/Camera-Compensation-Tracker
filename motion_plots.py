@@ -4,9 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
-# Кольори для позначення напрямку руху в конкретному інтервалі:
-# точка "в плюс" (рух вправо по X / вниз по Y) — зелена,
-# точка "в мінус" (рух вліво по X / вгору по Y) — червона.
+# зелений — рух "в плюс" (праворуч/вниз), червоний — "в мінус" (ліворуч/вгору)
 DIR_POSITIVE_COLOR = "tab:green"
 DIR_NEGATIVE_COLOR = "tab:red"
 
@@ -21,8 +19,7 @@ def _direction_legend_handles(positive_label, negative_label):
                markeredgecolor="black", markersize=8, label=negative_label),
     ]
 
-# Максимальне значення TTC, яке показуємо на графіку.
-# Все, що більше — просто обрізається.
+# все, що більше цього значення, на графіку просто обрізається
 TTC_Y_LIMIT = 1000
 
 def _load_data(json_path):
@@ -53,7 +50,7 @@ def _collect_object_series(data, motion_key):
     return series
 
 def _collect_ttc_series(data):
-    series = {}  
+    series = {}
 
     for interval in data:
         t = interval["t_end"]
@@ -71,7 +68,7 @@ def _collect_ttc_series(data):
 
 def plot_camera_motion(data, output_path):
     t = _time_axis(data)
-    # dx_px / dy_px в JSON — це приріст ЗА ІНТЕРВАЛ (0.5с). 
+    # dx_px/dy_px в JSON — це приріст за інтервал (0.5с), тому сумуємо накопичувально
     dx_delta = [interval["camera_motion"]["dx_px"] for interval in data]
     dy_delta = [interval["camera_motion"]["dy_px"] for interval in data]
     dx_cum = np.cumsum(dx_delta)
@@ -100,14 +97,15 @@ def plot_camera_motion(data, output_path):
     ax_dy.grid(True, alpha=0.3)
     ax_dy.legend(handles=_direction_legend_handles("рух вниз", "рух вгору"),
                  fontsize=8, loc="best")
+    # у піксельних координатах Y росте вниз, тож інвертуємо вісь, щоб графік не був дзеркальним
+    ax_dy.invert_yaxis()
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=150)
     plt.close(fig)
 
 def plot_object_real_motion(data, output_path):
-    # Власне переміщення об'єктів (real_motion) у пікселях, без урахування
-    # руху камери. 
+    # тут беремо real_motion — рух об'єкта з уже вирахуваним рухом камери
     series = _collect_object_series(data, "real_motion")
 
     fig, (ax_dx, ax_dy) = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
@@ -147,6 +145,7 @@ def plot_object_real_motion(data, output_path):
     ax_dy.add_artist(objects_legend_dy)
     ax_dy.legend(handles=_direction_legend_handles("рух вниз", "рух вгору"),
                  fontsize=7, loc="lower right", title="Напрямок")
+    ax_dy.invert_yaxis()
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=150)
@@ -165,7 +164,14 @@ def plot_time_to_collision(data, output_path):
             label = f"{s['class_name']} #{tid}"
             ax.plot(s["t"], s["ttc"], marker="o", label=label)
 
-    ax.set_ylim(0, TTC_Y_LIMIT)
+        # Верхня межа адаптується до даних, але ніколи не перевищує 1000 с.
+        # Значення TTC понад межу залишаються в даних, але не потрапляють
+        # у видиму область графіка.
+        max_ttc = max(max(s["ttc"]) for s in series.values() if s["ttc"])
+        y_max = min(TTC_Y_LIMIT, max_ttc)
+        if y_max <= 0:
+            y_max = TTC_Y_LIMIT
+        ax.set_ylim(0, y_max)
 
     ax.set_xlabel("час, с")
     ax.set_ylabel(f"TTC, с (показано до {TTC_Y_LIMIT} с)")
@@ -179,10 +185,7 @@ def plot_time_to_collision(data, output_path):
 
 def plot_motion_results(json_path="./object_motion_camera_compensated.json",
                          output_dir="./plots"):
-    # Читає JSON-файл з результатами (camera_motion + objects) та будує 3 графіки:
-    #   1. camera_motion.png       — накопичене переміщення камери (dx, dy)
-    #   2. object_real_motion.png  — накопичене власне переміщення об'єктів у пікселях
-    #   3. time_to_collision.png   — TTC по об'єктах (обрізано на 1000 с)
+    # Будує 3 графіки з JSON-результатів: рух камери, реальний рух об'єктів, TTC.
 
     os.makedirs(output_dir, exist_ok=True)
     data = _load_data(json_path)

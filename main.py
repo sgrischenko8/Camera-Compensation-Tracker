@@ -1,6 +1,6 @@
 import cv2
 import json
-from camera_motion import CameraMotionEstimator
+from camera_motion import CameraMotionEstimator, estimate_point_displacement
 from yolo_tracker import ObjectMotionTracker
 from motion_plots import plot_motion_results
 
@@ -10,6 +10,10 @@ RESULT_FILE = "./object_motion_camera_compensated.json"
 
 PX_THRESHOLD = 5.0
 AREA_RATIO_THRESHOLD = 0.08
+
+# номінальна тривалість камерного інтервалу; dt для об'єктів беремо
+# окремо з obj["dt_sec"], бо він може відхилятись від цих 0.5с
+CAM_INTERVAL_SEC = 0.5
 
 def describe_motion(dx, dy, area_ratio):
     directions = []
@@ -63,7 +67,6 @@ def main():
 
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    frame_area = width * height
     half_sec_frames = max(1, int(round(fps / 2.0)))
 
     fourcc = cv2.VideoWriter_fourcc(*"MJPG")
@@ -81,16 +84,23 @@ def main():
         print("Error: failed to read video")
         return
 
-    cam_estimator.init_first_frame(frame)
+    # спершу трекер об'єктів (щоб мати свіжі bbox для маски ORB), і тільки
+    # потім оцінювач руху камери — інакше RANSAC не відрізнить фон від
+    # великого рухомого об'єкта в кадрі
     obj_tracker.process_frame(frame, frame_count=1, current_time=0.0)
+    exclude_bboxes = [info["bbox"] for info in obj_tracker.active_tracks.values()]
+    cam_estimator.init_first_frame(frame, exclude_bboxes=exclude_bboxes)
+
     active_ttc_dict = {}
     out.write(obj_tracker.draw(frame, active_ttc_dict))
 
-    frame_count = 1           
-    cam_period_frame_count = 0   
-    cam_interval_number = 1
+    frame_count = 1
 
-    pending_obj_result = None
+    # єдиний лічильник кадрів для обох інтервалів (об'єктного і камерного),
+    # щоб вони закривались синхронно — інакше TTC-підпис блиматиме на межі
+    # кожного інтервалу
+    period_frame_count = 0
+    interval_number = 1
 
     while True:
         ret, frame = cap.read()
@@ -100,44 +110,34 @@ def main():
         frame_count += 1
         current_time = (frame_count - 1) / fps
 
-        cam_estimator.process_frame(frame)
-        cam_period_frame_count += 1
-
         obj_tracker.process_frame(frame, frame_count, current_time)
+        exclude_bboxes = [info["bbox"] for info in obj_tracker.active_tracks.values()]
+        cam_estimator.process_frame(frame, exclude_bboxes=exclude_bboxes)
 
-        if frame_count % half_sec_frames == 0:
-            obj_t_start = max(0.0, current_time - 0.5)
+        period_frame_count += 1
+
+        if period_frame_count >= half_sec_frames:
+            t_start = (interval_number - 1) * 0.5
+            t_end = t_start + 0.5
+
             obj_stats_list = obj_tracker.get_interval_motion(frame_count, half_sec_frames)
-            pending_obj_result = {
-                "t_start": obj_t_start,
-                "t_end": current_time,
-                "frame": frame_count,
-                "objects": obj_stats_list,
-            }
-            active_ttc_dict.clear()
-            for obj in obj_stats_list:
-                pass
-        
-        if cam_period_frame_count >= half_sec_frames:
-            cam_t_start = (cam_interval_number - 1) * 0.5
-            cam_t_end = cam_t_start + 0.5
 
             cam_stats = cam_estimator.get_interval_stats()
-            cam_dx_total = cam_stats["dx_px_per_sec"] * 0.5
-            cam_dy_total = cam_stats["dy_px_per_sec"] * 0.5
+            cam_dx_total = cam_stats["dx_px_per_sec"] * CAM_INTERVAL_SEC
+            cam_dy_total = cam_stats["dy_px_per_sec"] * CAM_INTERVAL_SEC
             cam_scale = cam_stats["scale"] if cam_stats["scale"] > 0 else 1.0
             cam_dir_str = describe_camera(cam_dx_total, cam_dy_total, cam_scale)
 
-            print(f"\n--- INTERVAL {cam_interval_number} ({cam_t_start:.1f}s - {cam_t_end:.1f}s) ---")
+            print(f"\n--- INTERVAL {interval_number} ({t_start:.1f}s - {t_end:.1f}s) ---")
             print(f"  X Speed:     {cam_stats['dx_px_per_sec']:+.2f} px/s")
             print(f"  Y Speed:     {cam_stats['dy_px_per_sec']:+.2f} px/s")
             print(f"  Scale:       {cam_scale:.4f}")
             print(f"  Valid steps: {cam_stats['valid_steps']}")
 
             interval_record = {
-                "interval": cam_interval_number,
-                "t_start": round(cam_t_start, 3),
-                "t_end": round(cam_t_end, 3),
+                "interval": interval_number,
+                "t_start": round(t_start, 3),
+                "t_end": round(t_end, 3),
                 "camera_motion": {
                     "dx_px": round(cam_dx_total, 2),
                     "dy_px": round(cam_dy_total, 2),
@@ -150,40 +150,46 @@ def main():
                 "objects": [],
             }
 
-            obj_stats_list = pending_obj_result["objects"] if pending_obj_result else []
-            if pending_obj_result is None:
-                print("  [!] No object tracker data for this interval (out of sync)")
-
             if not obj_stats_list:
                 print("  > No active objects for analysis.")
 
             active_ttc_dict = {}
 
             for obj in obj_stats_list:
-                real_dx = obj["dx_px"] - cam_dx_total
-                real_dy = obj["dy_px"] - cam_dy_total
-                real_area_ratio = obj["area_ratio"] / (cam_scale ** 2)
+                obj_dt = obj["dt_sec"]  # реальний dt цього об'єкта, а не завжди 0.5с
+
+                current_box = obj_tracker.active_tracks.get(obj["track_id"], {}).get("bbox")
+                if current_box:
+                    x1, y1, x2, y2 = current_box
+                    anchor_x = (x1 + x2) / 2.0
+                    anchor_y = (y1 + y2) / 2.0
+                else:
+                    # об'єкт щойно зник з треку — компенсуємо як для центру кадру
+                    anchor_x, anchor_y = width / 2.0, height / 2.0
+
+                # зсув камери саме в позиції об'єкта, масштабований під реальний dt
+                dt_scale = obj_dt / CAM_INTERVAL_SEC if CAM_INTERVAL_SEC > 0 else 1.0
+                cam_dx_at_obj, cam_dy_at_obj = estimate_point_displacement(cam_stats, anchor_x, anchor_y)
+                cam_dx_at_obj *= dt_scale
+                cam_dy_at_obj *= dt_scale
+                cam_scale_for_obj = cam_scale ** dt_scale if cam_scale > 0 else 1.0
+
+                real_dx = obj["dx_px"] - cam_dx_at_obj
+                real_dy = obj["dy_px"] - cam_dy_at_obj
+                real_area_ratio = obj["area_ratio"] / (cam_scale_for_obj ** 2)
 
                 screen_dir_str = describe_motion(obj["dx_px"], obj["dy_px"], obj["area_ratio"])
                 real_dir_str = describe_motion(real_dx, real_dy, real_area_ratio)
-                
-                # --- (Time-to-Collision, TTC) ---
+
+                # TTC за гіперболічною моделлю: при сталій швидкості зближення
+                # площа росте як 1/(1-t/T)^2, звідки T = 2 / (темп росту площі).
+                # Залежить лише від темпу росту площі, а не від того, скільки
+                # ще кадру лишилось вільним
                 time_to_collision = None
-                
-                if real_area_ratio > 1.0:
-                    current_box = obj_tracker.active_tracks.get(obj["track_id"], {}).get("bbox")
-                    if current_box:
-                        x1, y1, x2, y2 = current_box
-                        current_area = max(1.0, (x2 - x1) * (y2 - y1))
-                        
-                        area_growth_per_sec = (real_area_ratio - 1.0) / 0.5
-                        
-                        if area_growth_per_sec > 0:
-                            remaining_area = frame_area - current_area
-                            if remaining_area > 0:
-                                time_to_collision = remaining_area / (current_area * area_growth_per_sec)
-                            else:
-                                time_to_collision = 0.0
+                if real_area_ratio > 1.0 and obj_dt > 0:
+                    area_growth_rate = (real_area_ratio - 1.0) / obj_dt
+                    if area_growth_rate > 0:
+                        time_to_collision = 2.0 / area_growth_rate
 
                 if time_to_collision is not None:
                     active_ttc_dict[obj["track_id"]] = time_to_collision
@@ -199,6 +205,7 @@ def main():
                 interval_record["objects"].append({
                     "track_id": obj["track_id"],
                     "class_name": obj["class_name"],
+                    "dt_sec": round(obj_dt, 3),
                     "screen_motion": {
                         "dx_px": round(obj["dx_px"], 2),
                         "dy_px": round(obj["dy_px"], 2),
@@ -216,9 +223,8 @@ def main():
 
             result_log.append(interval_record)
 
-            pending_obj_result = None
-            cam_period_frame_count = 0
-            cam_interval_number += 1
+            period_frame_count = 0
+            interval_number += 1
 
         out.write(obj_tracker.draw(frame, active_ttc_dict))
 
